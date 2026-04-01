@@ -5,7 +5,7 @@ from openai import OpenAI
 st.set_page_config(page_title="AI Smart Class Assistant", page_icon="🎓")
 
 # Внеси го твојот API Клуч тука
-client = OpenAI(api_key="ТВОЈОТ_API_КЛУЧ_ТУКА")
+client = OpenAI(api_key=st.secrets["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"])
 
 # --- СТИЛИЗИРАЊЕ И НАСЛОВ ---
 st.title("🎓 AI Smart Class Assistant")
