@@ -7,8 +7,8 @@ import os
 # ─────────────────────────────────────────────
 # КОНФИГУРАЦИЈА
 # ─────────────────────────────────────────────
-OLLAMA_BASE_URL = "http://localhost:11434"  # Ollama API (локален сервер)
-OLLAMA_MODEL    = "llama3.2"               # Смени во llama3.1 ако нема 3.2
+OLLAMA_BASE_URL = "http://localhost:11434"
+OLLAMA_MODEL    = "llama3.2"
 
 st.set_page_config(
     page_title="AI Smart Class Assistant",
@@ -65,7 +65,8 @@ def ollama_chat(system_prompt: str, user_message: str, history: list = None) -> 
 def transcribe_audio(audio_file) -> str:
     """
     Транскрибирај аудио со faster-whisper (локално, без API клуч).
-    Симни со: pip install faster-whisper
+    Користи medium модел за подобра точност.
+    За македонски јазик поставено language='mk'.
     """
     try:
         from faster_whisper import WhisperModel
@@ -83,10 +84,14 @@ def transcribe_audio(audio_file) -> str:
         tmp_path = tmp.name
 
     try:
-        # device="cpu" работи без GPU. Смени во "cuda" ако имаш NVIDIA GPU.
-        # model_size: "tiny" (брз), "base", "small", "medium", "large-v3" (точен)
-        model = WhisperModel("small", device="cpu", compute_type="int8")
-        segments, info = model.transcribe(tmp_path, beam_size=5)
+        # medium = добар баланс помеѓу брзина и точност (~1.5 GB)
+        # Смени во "large-v3" за максимална точност (3 GB, побавно)
+        # Смени device="cuda" ако имаш NVIDIA GPU (многу побрзо)
+        model = WhisperModel("medium", device="cpu", compute_type="int8")
+
+        # language="mk" за македонски — отстрани го ако предавањето е на друг јазик
+        segments, info = model.transcribe(tmp_path, beam_size=5, language="mk")
+
         transcript = " ".join(segment.text for segment in segments)
         return transcript.strip()
     except Exception as e:
@@ -130,11 +135,10 @@ else:
 st.markdown("---")
 
 # ─────────────────────────────────────────────
-# 1. ТРАНСКРИПЦИЈА (faster-whisper, локално)
+# 1. ТРАНСКРИПЦИЈА (faster-whisper medium, локално)
 # ─────────────────────────────────────────────
 st.header("1. 🎙️ Прикачи предавање")
 
-MAX_FILE_MB = 500  # Без ограничување на OpenAI — локален Whisper може повеќе
 uploaded_file = st.file_uploader(
     "Поддржани формати: MP3, WAV, M4A",
     type=["mp3", "wav", "m4a"]
@@ -144,10 +148,10 @@ if uploaded_file:
     file_size_mb = len(uploaded_file.getvalue()) / (1024 * 1024)
     st.caption(f"📁 Фајл: `{uploaded_file.name}` — {file_size_mb:.1f} MB")
 
-    # Информација за брзина
     st.info(
-        "💡 **Брзина на транскрипција:** ~1 мин аудио ≈ 30 сек процесирање (CPU). "
-        "За поголема точност смени `model_size` на `medium` или `large-v3` во кодот."
+        "💡 **Модел:** Whisper `medium` (македонски јазик) — "
+        "~1.5 GB, прв пат се симнува автоматски. "
+        "Брзина: ~1 мин аудио ≈ 1-2 мин процесирање на CPU."
     )
 
     if st.button("🚀 Процесирај го предавањето", type="primary"):
@@ -161,7 +165,7 @@ if uploaded_file:
                 'file_name':      uploaded_file.name
             })
 
-        with st.spinner("Транскрибирање со Whisper (локално)... Ова може да трае неколку минути."):
+        with st.spinner("Транскрибирање со Whisper medium (македонски)... Ова може да трае неколку минути."):
             uploaded_file.seek(0)
             result = transcribe_audio(uploaded_file)
             if result.startswith("❌"):
@@ -195,11 +199,10 @@ if st.session_state['transcript']:
                 system_prompt = (
                     "Ти си академски асистент. Од дадениот транскрипт:\n"
                     "1. Напиши кратко резиме (3-5 реченици) на македонски јазик\n"
-                    "2. Издвој 5 клучни концепти/термини\n"
+                    "2. Издвои 5 клучни концепти/термини\n"
                     "3. Препорачај 3 конкретни извори (книги или онлајн курсеви) со кратки описи\n"
                     "Користи markdown форматирање."
                 )
-                # Испрати само прв дел од транскриптот ако е многу долг (Llama има ограничен контекст)
                 transcript_chunk = st.session_state['transcript'][:4000]
                 result = ollama_chat(system_prompt, transcript_chunk)
                 st.session_state['summary'] = result
@@ -236,7 +239,6 @@ if st.session_state['transcript']:
                 "Ако прашањето не е поврзано со транскриптот, кажи тоа учтиво. "
                 "Одговарај на македонски јазик, јасно и прецизно."
             )
-            # За историјата испраќаме само последните 6 пораки (контекст ограничување)
             recent_history = st.session_state['chat_history'][-6:]
             answer = ollama_chat(system_prompt, user_query, history=recent_history[:-1])
             st.session_state['chat_history'].append({"role": "assistant", "content": answer})
@@ -266,9 +268,7 @@ if st.session_state['transcript']:
             )
             raw = ollama_chat(system_prompt, st.session_state['transcript'][:3000])
 
-            # Почисти го одговорот (Llama понекогаш додава текст)
             raw = raw.strip()
-            # Пронајди го JSON делот
             start = raw.find("{")
             end   = raw.rfind("}") + 1
             if start != -1 and end > start:
@@ -281,7 +281,7 @@ if st.session_state['transcript']:
                     st.error("❌ Квизот е празен. Обиди се повторно.")
             except json.JSONDecodeError:
                 st.error("❌ Грешка при читање на квизот. Обиди се повторно.")
-                st.code(raw, language="text")  # Прикажи го raw одговорот за дебагирање
+                st.code(raw, language="text")
 
     if st.session_state['quiz_data']:
         with st.form("quiz_form"):
@@ -324,4 +324,4 @@ else:
     st.info("ℹ️ Прикачете аудио фајл за да започнете.")
 
 st.markdown("---")
-st.caption("AI Smart Class Assistant • faster-whisper (транскрипција) + Ollama/Llama3.2 (анализа) • 100% локално & бесплатно")
+st.caption("AI Smart Class Assistant • Whisper medium/mk (транскрипција) + Ollama/Llama3.2 (анализа) • 100% локално & бесплатно")
