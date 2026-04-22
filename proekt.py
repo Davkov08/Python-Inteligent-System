@@ -1,80 +1,142 @@
 import streamlit as st
-import anthropic
-from openai import OpenAI
 import json
+import requests
+import tempfile
+import os
 
-# --- Подесување на страницата ---
+# ─────────────────────────────────────────────
+# КОНФИГУРАЦИЈА
+# ─────────────────────────────────────────────
+OLLAMA_BASE_URL = "http://localhost:11434"  # Ollama API (локален сервер)
+OLLAMA_MODEL    = "llama3.2"               # Смени во llama3.1 ако нема 3.2
+
 st.set_page_config(
     page_title="AI Smart Class Assistant",
     page_icon="🎓",
     layout="wide"
 )
 
-# --- Верификација на API клучеви ---
-def get_clients():
-    """Иницијализирање на OpenAI (само за Whisper) и Anthropic (за сè друго)."""
-    errors = []
+# ─────────────────────────────────────────────
+# ПОМОШНИ ФУНКЦИИ
+# ─────────────────────────────────────────────
+
+def check_ollama():
+    """Провери дали Ollama серверот е активен."""
+    try:
+        r = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=3)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
+def ollama_chat(system_prompt: str, user_message: str, history: list = None) -> str:
+    """Праќа порака до Ollama и враќа одговор."""
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    if history:
+        messages.extend(history)
+    messages.append({"role": "user", "content": user_message})
+
+    payload = {
+        "model": OLLAMA_MODEL,
+        "messages": messages,
+        "stream": False,
+        "options": {
+            "temperature": 0.7,
+            "num_predict": 1024,
+        }
+    }
+    try:
+        r = requests.post(
+            f"{OLLAMA_BASE_URL}/api/chat",
+            json=payload,
+            timeout=120
+        )
+        r.raise_for_status()
+        data = r.json()
+        return data["message"]["content"]
+    except requests.exceptions.ConnectionError:
+        return "❌ Ollama серверот не е достапен. Стартувај `ollama serve` во терминал."
+    except Exception as e:
+        return f"❌ Грешка: {e}"
+
+
+def transcribe_audio(audio_file) -> str:
+    """
+    Транскрибирај аудио со faster-whisper (локално, без API клуч).
+    Симни со: pip install faster-whisper
+    """
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError:
+        return (
+            "❌ `faster-whisper` не е инсталиран.\n"
+            "Изврши: `pip install faster-whisper` па рестартирај ја апликацијата."
+        )
+
+    with tempfile.NamedTemporaryFile(
+        delete=False,
+        suffix="." + audio_file.name.split(".")[-1]
+    ) as tmp:
+        tmp.write(audio_file.read())
+        tmp_path = tmp.name
 
     try:
-        openai_key = st.secrets["OPENAI_API_KEY"]
-        openai_client = OpenAI(api_key=openai_key)
-    except KeyError:
-        openai_client = None
-        errors.append("❌ `OPENAI_API_KEY` не е поставен во Secrets (потребен за транскрипција).")
-
-    try:
-        anthropic_key = st.secrets["ANTHROPIC_API_KEY"]
-        anthropic_client = anthropic.Anthropic(api_key=anthropic_key)
-    except KeyError:
-        anthropic_client = None
-        errors.append("❌ `ANTHROPIC_API_KEY` не е поставен во Secrets (потребен за резиме/чет/квиз).")
-
-    if errors:
-        for e in errors:
-            st.error(e)
-        st.markdown("""
-        **Додај ги клучевите во Streamlit → Settings → Secrets:**
-        ```toml
-        OPENAI_API_KEY = "sk-proj-..."
-        ANTHROPIC_API_KEY = "sk-ant-..."
-        ```
-        - OpenAI клуч: [platform.openai.com/api-keys](https://platform.openai.com/api-keys) — потребен само за Whisper транскрипција
-        - Anthropic клуч: [console.anthropic.com](https://console.anthropic.com) — за резиме, чет и квиз
-        """)
-        st.stop()
-
-    return openai_client, anthropic_client
+        # device="cpu" работи без GPU. Смени во "cuda" ако имаш NVIDIA GPU.
+        # model_size: "tiny" (брз), "base", "small", "medium", "large-v3" (точен)
+        model = WhisperModel("small", device="cpu", compute_type="int8")
+        segments, info = model.transcribe(tmp_path, beam_size=5)
+        transcript = " ".join(segment.text for segment in segments)
+        return transcript.strip()
+    except Exception as e:
+        return f"❌ Грешка при транскрипција: {e}"
+    finally:
+        os.unlink(tmp_path)
 
 
-openai_client, anthropic_client = get_clients()
-
-# --- Сесија ---
+# ─────────────────────────────────────────────
+# СЕСИЈА
+# ─────────────────────────────────────────────
 defaults = {
-    'transcript': "",
-    'summary': "",
-    'chat_history': [],
-    'quiz_data': [],
-    'quiz_answers': {},
+    'transcript':     "",
+    'summary':        "",
+    'chat_history':   [],
+    'quiz_data':      [],
+    'quiz_answers':   {},
     'quiz_submitted': False,
-    'file_name': "",
+    'file_name':      "",
 }
 for key, val in defaults.items():
     if key not in st.session_state:
         st.session_state[key] = val
 
-# --- Заглавие ---
+# ─────────────────────────────────────────────
+# ЗАГЛАВИЕ
+# ─────────────────────────────────────────────
 st.title("🎓 AI Smart Class Assistant")
 st.markdown("Прикачи аудио предавање → добиј транскрипт, резиме, литература, чет-бот и квиз.")
+st.markdown("*(Powered by Ollama + Llama 3.2 — целосно локално, без API трошоци)*")
+
+# --- Статус на Ollama ---
+if check_ollama():
+    st.success(f"✅ Ollama е активен | Модел: `{OLLAMA_MODEL}`")
+else:
+    st.error(
+        "❌ Ollama не е активен! Отвори PowerShell и изврши: `ollama serve`  |  "
+        "Потоа симни модел: `ollama pull llama3.2`"
+    )
+
 st.markdown("---")
 
 # ─────────────────────────────────────────────
-# 1. ТРАНСКРИПЦИЈА (OpenAI Whisper)
+# 1. ТРАНСКРИПЦИЈА (faster-whisper, локално)
 # ─────────────────────────────────────────────
 st.header("1. 🎙️ Прикачи предавање")
 
-MAX_FILE_MB = 25
+MAX_FILE_MB = 500  # Без ограничување на OpenAI — локален Whisper може повеќе
 uploaded_file = st.file_uploader(
-    f"Поддржани формати: MP3, WAV, M4A (максимум {MAX_FILE_MB} MB)",
+    "Поддржани формати: MP3, WAV, M4A",
     type=["mp3", "wav", "m4a"]
 )
 
@@ -82,38 +144,34 @@ if uploaded_file:
     file_size_mb = len(uploaded_file.getvalue()) / (1024 * 1024)
     st.caption(f"📁 Фајл: `{uploaded_file.name}` — {file_size_mb:.1f} MB")
 
-    if file_size_mb > MAX_FILE_MB:
-        st.error(f"❌ Фајлот е поголем од {MAX_FILE_MB} MB.")
-    else:
-        if st.button("🚀 Процесирај го предавањето", type="primary"):
-            if uploaded_file.name != st.session_state['file_name']:
-                st.session_state.update({
-                    'transcript': "", 'summary': "",
-                    'chat_history': [], 'quiz_data': [],
-                    'quiz_submitted': False, 'file_name': uploaded_file.name
-                })
+    # Информација за брзина
+    st.info(
+        "💡 **Брзина на транскрипција:** ~1 мин аудио ≈ 30 сек процесирање (CPU). "
+        "За поголема точност смени `model_size` на `medium` или `large-v3` во кодот."
+    )
 
-            with st.spinner("Транскрибирање со Whisper AI..."):
-                try:
-                    uploaded_file.seek(0)
-                    transcript_response = openai_client.audio.transcriptions.create(
-                        model="whisper-1",
-                        file=(uploaded_file.name, uploaded_file.read(), uploaded_file.type),
-                        response_format="text"
-                    )
-                    st.session_state['transcript'] = transcript_response
-                    st.success("✅ Транскрипцијата е успешна!")
-                except Exception as e:
-                    err = str(e)
-                    if "401" in err or "invalid_api_key" in err:
-                        st.error("❌ Неправилен OpenAI API клуч. Провери го во Secrets.")
-                    elif "429" in err or "quota" in err:
-                        st.error("💳 OpenAI rate limit. Додај кредити на platform.openai.com/settings/billing")
-                    else:
-                        st.error(f"❌ Грешка: {e}")
+    if st.button("🚀 Процесирај го предавањето", type="primary"):
+        if uploaded_file.name != st.session_state['file_name']:
+            st.session_state.update({
+                'transcript':     "",
+                'summary':        "",
+                'chat_history':   [],
+                'quiz_data':      [],
+                'quiz_submitted': False,
+                'file_name':      uploaded_file.name
+            })
+
+        with st.spinner("Транскрибирање со Whisper (локално)... Ова може да трае неколку минути."):
+            uploaded_file.seek(0)
+            result = transcribe_audio(uploaded_file)
+            if result.startswith("❌"):
+                st.error(result)
+            else:
+                st.session_state['transcript'] = result
+                st.success("✅ Транскрипцијата е успешна!")
 
 # ─────────────────────────────────────────────
-# 2. РЕЗИМЕ И ЛИТЕРАТУРА (Claude)
+# 2. РЕЗИМЕ И ЛИТЕРАТУРА (Llama преку Ollama)
 # ─────────────────────────────────────────────
 if st.session_state['transcript']:
     st.markdown("---")
@@ -133,23 +191,18 @@ if st.session_state['transcript']:
     with col2:
         st.subheader("📚 Резиме и Литература")
         if st.button("✨ Генерирај Резиме и Литература"):
-            with st.spinner("Claude анализира..."):
-                try:
-                    response = anthropic_client.messages.create(
-                        model="claude-sonnet-4-20250514",
-                        max_tokens=1024,
-                        system=(
-                            "Ти си академски асистент. Од дадениот транскрипт:\n"
-                            "1. Напиши кратко резиме (3-5 реченици) на македонски јазик\n"
-                            "2. Издвој 5 клучни концепти/термини\n"
-                            "3. Препорачај 3 конкретни извори (книги или онлајн курсеви) со кратки описи\n"
-                            "Користи markdown форматирање."
-                        ),
-                        messages=[{"role": "user", "content": st.session_state['transcript']}]
-                    )
-                    st.session_state['summary'] = response.content[0].text
-                except Exception as e:
-                    st.error(f"❌ Грешка: {e}")
+            with st.spinner("Llama анализира... (може да трае 30-60 сек)"):
+                system_prompt = (
+                    "Ти си академски асистент. Од дадениот транскрипт:\n"
+                    "1. Напиши кратко резиме (3-5 реченици) на македонски јазик\n"
+                    "2. Издвој 5 клучни концепти/термини\n"
+                    "3. Препорачај 3 конкретни извори (книги или онлајн курсеви) со кратки описи\n"
+                    "Користи markdown форматирање."
+                )
+                # Испрати само прв дел од транскриптот ако е многу долг (Llama има ограничен контекст)
+                transcript_chunk = st.session_state['transcript'][:4000]
+                result = ollama_chat(system_prompt, transcript_chunk)
+                st.session_state['summary'] = result
 
         if st.session_state['summary']:
             st.markdown(st.session_state['summary'])
@@ -161,7 +214,7 @@ if st.session_state['transcript']:
             )
 
     # ─────────────────────────────────────────────
-    # 3. ЧЕТ-БОТ СО ИСТОРИЈА (Claude)
+    # 3. ЧЕТ-БОТ СО ИСТОРИЈА (Llama преку Ollama)
     # ─────────────────────────────────────────────
     st.markdown("---")
     st.header("🤖 Прашај го асистентот")
@@ -176,23 +229,18 @@ if st.session_state['transcript']:
         st.session_state['chat_history'].append({"role": "user", "content": user_query})
         st.chat_message("user").write(user_query)
 
-        with st.spinner("Claude размислува..."):
-            try:
-                response = anthropic_client.messages.create(
-                    model="claude-sonnet-4-20250514",
-                    max_tokens=1024,
-                    system=(
-                        f"Одговарај само врз основа на овој транскрипт:\n\n{st.session_state['transcript']}\n\n"
-                        "Ако прашањето не е поврзано со транскриптот, кажи тоа учтиво. "
-                        "Одговарај на македонски јазик, јасно и прецизно."
-                    ),
-                    messages=st.session_state['chat_history']
-                )
-                answer = response.content[0].text
-                st.session_state['chat_history'].append({"role": "assistant", "content": answer})
-                st.chat_message("assistant").write(answer)
-            except Exception as e:
-                st.error(f"❌ Грешка: {e}")
+        with st.spinner("Llama размислува..."):
+            system_prompt = (
+                f"Одговарај само врз основа на овој транскрипт:\n\n"
+                f"{st.session_state['transcript'][:3000]}\n\n"
+                "Ако прашањето не е поврзано со транскриптот, кажи тоа учтиво. "
+                "Одговарај на македонски јазик, јасно и прецизно."
+            )
+            # За историјата испраќаме само последните 6 пораки (контекст ограничување)
+            recent_history = st.session_state['chat_history'][-6:]
+            answer = ollama_chat(system_prompt, user_query, history=recent_history[:-1])
+            st.session_state['chat_history'].append({"role": "assistant", "content": answer})
+            st.chat_message("assistant").write(answer)
 
     if st.session_state['chat_history']:
         if st.button("🗑️ Исчисти историја"):
@@ -200,43 +248,50 @@ if st.session_state['transcript']:
             st.rerun()
 
     # ─────────────────────────────────────────────
-    # 4. ИНТЕРАКТИВЕН КВИЗ (Claude)
+    # 4. ИНТЕРАКТИВЕН КВИЗ (Llama преку Ollama)
     # ─────────────────────────────────────────────
     st.markdown("---")
     st.header("📝 Квиз за вежбање")
 
     if st.button("🎲 Генерирај нов квиз"):
         st.session_state['quiz_submitted'] = False
-        st.session_state['quiz_answers'] = {}
-        with st.spinner("Claude создава прашања..."):
+        st.session_state['quiz_answers']   = {}
+
+        with st.spinner("Llama создава прашања... (30-60 сек)"):
+            system_prompt = (
+                "Генерирај 4 прашања со повеќекратен избор на македонски јазик "
+                "базирани на дадениот текст. "
+                "Врати САМО валиден JSON без никаков друг текст, без markdown, без објаснување:\n"
+                '{"questions": [{"question": "...", "options": ["A) ...", "B) ...", "C) ...", "D) ..."], "answer": "A) ..."}]}'
+            )
+            raw = ollama_chat(system_prompt, st.session_state['transcript'][:3000])
+
+            # Почисти го одговорот (Llama понекогаш додава текст)
+            raw = raw.strip()
+            # Пронајди го JSON делот
+            start = raw.find("{")
+            end   = raw.rfind("}") + 1
+            if start != -1 and end > start:
+                raw = raw[start:end]
+
             try:
-                quiz_response = anthropic_client.messages.create(
-                    model="claude-sonnet-4-20250514",
-                    max_tokens=1024,
-                    system=(
-                        "Генерирај 4 прашања со повеќекратен избор на македонски јазик "
-                        "базирани на дадениот текст. "
-                        "Врати САМО валиден JSON без никаков друг текст:\n"
-                        '{"questions": [{"question": "...", "options": ["A) ...", "B) ...", "C) ...", "D) ..."], "answer": "A) ..."}]}'
-                    ),
-                    messages=[{"role": "user", "content": st.session_state['transcript']}]
-                )
-                raw = quiz_response.content[0].text.strip()
-                raw = raw.replace("```json", "").replace("```", "").strip()
                 quiz_json = json.loads(raw)
                 st.session_state['quiz_data'] = quiz_json.get("questions", [])
+                if not st.session_state['quiz_data']:
+                    st.error("❌ Квизот е празен. Обиди се повторно.")
             except json.JSONDecodeError:
                 st.error("❌ Грешка при читање на квизот. Обиди се повторно.")
-            except Exception as e:
-                st.error(f"❌ Грешка: {e}")
+                st.code(raw, language="text")  # Прикажи го raw одговорот за дебагирање
 
     if st.session_state['quiz_data']:
         with st.form("quiz_form"):
             for i, q in enumerate(st.session_state['quiz_data']):
                 st.markdown(f"**Прашање {i+1}:** {q['question']}")
                 st.session_state['quiz_answers'][i] = st.radio(
-                    f"q{i}", options=q['options'],
-                    key=f"q_{i}", label_visibility="collapsed"
+                    f"q{i}",
+                    options=q['options'],
+                    key=f"q_{i}",
+                    label_visibility="collapsed"
                 )
                 st.markdown("")
 
@@ -253,19 +308,20 @@ if st.session_state['transcript']:
                     correct += 1
                     st.success(f"✅ Прашање {i+1}: Точно!")
                 else:
-                    st.error(f"❌ Прашање {i+1}: Нeточно. Точен одговор: **{q['answer']}**")
+                    st.error(f"❌ Прашање {i+1}: Неточно. Точен одговор: **{q['answer']}**")
 
-            score_pct = int((correct / len(st.session_state['quiz_data'])) * 100)
+            total     = len(st.session_state['quiz_data'])
+            score_pct = int((correct / total) * 100)
             if score_pct == 100:
                 st.balloons()
-                st.success(f"🏆 {correct}/{len(st.session_state['quiz_data'])} ({score_pct}%) — Одлично!")
+                st.success(f"🏆 {correct}/{total} ({score_pct}%) — Одлично!")
             elif score_pct >= 50:
-                st.warning(f"📊 {correct}/{len(st.session_state['quiz_data'])} ({score_pct}%) — Добро!")
+                st.warning(f"📊 {correct}/{total} ({score_pct}%) — Добро!")
             else:
-                st.error(f"📊 {correct}/{len(st.session_state['quiz_data'])} ({score_pct}%) — Прочитај повторно.")
+                st.error(f"📊 {correct}/{total} ({score_pct}%) — Прочитај повторно.")
 
 else:
     st.info("ℹ️ Прикачете аудио фајл за да започнете.")
 
 st.markdown("---")
-st.caption("AI Smart Class Assistant • Whisper (транскрипција) + Claude (анализа)")
+st.caption("AI Smart Class Assistant • faster-whisper (транскрипција) + Ollama/Llama3.2 (анализа) • 100% локално & бесплатно")
